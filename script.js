@@ -1,4 +1,7 @@
-// ================= DATOS INICIALES (HUANCAYO) =================
+// PEGA AQUÍ LA URL DE TU REALTIME DATABASE (SIN LA BARRA "/" AL FINAL)
+const FIREBASE_DB_URL = "https://ruta-segura-hyo-default-rtdb.firebaseio.com";
+
+// ================= DATOS INICIALES DE RESPALDO (HUANCAYO) =================
 const defaultIncidents = [
   {
     id: 1,
@@ -7,9 +10,8 @@ const defaultIncidents = [
     zone: 'El Tambo',
     place: 'Av. Huancavelica y Jr. Julio Sumar',
     desc: 'Dos sujetos en moto lineal arrebataron celular en paradero.',
-    time: 'Hace 12 min',
-    confirmations: 4,
-    confirmedByUser: false
+    createdAt: Date.now() - 12 * 60000,
+    confirmations: 4
   },
   {
     id: 2,
@@ -18,9 +20,8 @@ const defaultIncidents = [
     zone: 'Huancayo Centro',
     place: 'Prolongación Puno y Av. Ferrocarril',
     desc: 'Postes de alumbrado público apagados desde las 7:00 p.m.',
-    time: 'Hace 35 min',
-    confirmations: 7,
-    confirmedByUser: false
+    createdAt: Date.now() - 35 * 60000,
+    confirmations: 7
   },
   {
     id: 3,
@@ -29,20 +30,8 @@ const defaultIncidents = [
     zone: 'Chilca',
     place: 'Óvalo de Chilca / Av. 9 de Diciembre',
     desc: 'Asalto al paso cerca del puente peatonal. Transitar con precaución.',
-    time: 'Hace 1 hora',
-    confirmations: 5,
-    confirmedByUser: false
-  },
-  {
-    id: 4,
-    type: 'Cámara con fallas',
-    severity: 'medium',
-    zone: 'Huancayo Centro',
-    place: 'Av. Giráldez cuadra 5',
-    desc: 'Domo de videovigilancia municipal sin giro ni luz indicadora.',
-    time: 'Hace 2 horas',
-    confirmations: 3,
-    confirmedByUser: false
+    createdAt: Date.now() - 60 * 60000,
+    confirmations: 5
   }
 ];
 
@@ -67,13 +56,6 @@ const defaultPatrolZones = [
     zone: 'Chilca',
     place: 'Parque Abel Martínez / Frente a Comisaría Chilca',
     schedule: 'Presencia policial continua y ronda nocturna'
-  },
-  {
-    id: 104,
-    agency: 'Cámara Operativa + Serenazgo',
-    zone: 'El Tambo',
-    place: 'Óvalo Julio Sumar y Av. Huancavelica',
-    schedule: 'Monitoreo centralizado y unidad móvil en turno noche'
   }
 ];
 
@@ -158,100 +140,155 @@ const emergencyContacts = [
   }
 ];
 
-// ================= ESTADO CON PERSISTENCIA LOCAL =================
-let incidents = JSON.parse(localStorage.getItem('hyo_incidents')) || defaultIncidents;
-let patrolZones = JSON.parse(localStorage.getItem('hyo_patrols')) || defaultPatrolZones;
+// ================= ESTADO GLOBAL =================
+let incidents = [...defaultIncidents];
+let patrolZones = [...defaultPatrolZones];
+let confirmedIds = JSON.parse(localStorage.getItem('hyo_confirmed_ids') || '[]');
 let currentZoneFilter = 'Todos';
 let currentPatrolFilter = 'Todos';
 let selectedDanger = { type: 'Arrebato', severity: 'high' };
 let selectedPatrolAgency = 'Serenazgo';
 let unreadNotifs = 0;
+let lastKnownIncidentKey = null;
 
-function saveState() {
-  localStorage.setItem('hyo_incidents', JSON.stringify(incidents));
-  localStorage.setItem('hyo_patrols', JSON.stringify(patrolZones));
+function formatRelativeTime(timestamp) {
+  if (!timestamp) return 'Reciente';
+  const diffMins = Math.max(0, Math.floor((Date.now() - timestamp) / 60000));
+  if (diffMins < 1) return 'Ahora mismo';
+  if (diffMins < 60) return `Hace ${diffMins} min`;
+  const diffHours = Math.floor(diffMins / 60);
+  if (diffHours < 24) return `Hace ${diffHours} h`;
+  return `Hace ${Math.floor(diffHours / 24)} d`;
 }
 
-// ================= NOTIFICACIONES (APP + SISTEMA) =================
+// ================= SINCRONIZACIÓN CON FIREBASE =================
+async function fetchCloudData(isInitial = false) {
+  try {
+    const [incRes, patRes] = await Promise.all([
+      fetch(`${FIREBASE_DB_URL}/reportes.json`),
+      fetch(`${FIREBASE_DB_URL}/vigilados.json`)
+    ]);
+
+    if (incRes.ok) {
+      const incData = await incRes.json();
+      if (incData) {
+        const cloudIncidents = Object.entries(incData).map(([fbKey, val]) => ({
+          fbKey,
+          ...val
+        }));
+        cloudIncidents.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+
+        const newestKey = cloudIncidents[0]?.fbKey;
+        if (!isInitial && newestKey && lastKnownIncidentKey && newestKey !== lastKnownIncidentKey) {
+          const newest = cloudIncidents[0];
+          showPushNotification(
+            `Nueva alerta en ${newest.zone}: ${newest.type}`,
+            `${newest.place} · ${newest.desc}`
+          );
+        }
+        lastKnownIncidentKey = newestKey;
+        incidents = [...cloudIncidents, ...defaultIncidents];
+      } else {
+        incidents = [...defaultIncidents];
+      }
+      renderIncidents();
+    }
+
+    if (patRes.ok) {
+      const patData = await patRes.json();
+      if (patData) {
+        const cloudPatrols = Object.entries(patData).map(([fbKey, val]) => ({
+          fbKey,
+          ...val
+        }));
+        cloudPatrols.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+        patrolZones = [...cloudPatrols, ...defaultPatrolZones];
+      } else {
+        patrolZones = [...defaultPatrolZones];
+      }
+      renderPatrolZones();
+    }
+  } catch (err) {
+    console.warn('Error sincronizando con Firebase:', err);
+  }
+}
+
+// ================= NOTIFICACIONES =================
 function enableSystemNotifications() {
   unreadNotifs = 0;
   document.getElementById('notifCounter').textContent = '0';
 
   if (!('Notification' in window)) {
-    showPushNotification('Alertas activas', 'Recibirás avisos inmediatos dentro de la aplicación.');
+    showPushNotification('Alertas activas', 'Recibirás avisos inmediatos dentro de la app.');
     return;
   }
 
   if (Notification.permission === 'granted') {
-    showPushNotification('Notificaciones activadas', 'Ya estás recibiendo alertas vecinales de Huancayo.');
+    showPushNotification('Notificaciones activadas', 'Recibirás alertas vecinales de Huancayo en tiempo real.');
   } else if (Notification.permission !== 'denied') {
     Notification.requestPermission().then(permission => {
       if (permission === 'granted') {
-        showPushNotification('Permiso concedido', 'Te avisaremos cuando haya reportes cerca.');
+        showPushNotification('Permiso concedido', 'Te avisaremos cuando otros usuarios reporten.');
       } else {
-        showPushNotification('Aviso interno activo', 'Verás las alertas en la parte superior de la app.');
+        showPushNotification('Aviso interno activo', 'Verás las alertas en la parte superior de la pantalla.');
       }
     });
   } else {
-    showPushNotification('Notificaciones internas', 'Las alertas aparecerán en tiempo real en tu pantalla.');
+    showPushNotification('Notificaciones internas', 'Las alertas aparecerán en tiempo real en tu app.');
   }
 }
 
 function showPushNotification(title, body) {
-  // Vibración en celular
   if (navigator.vibrate) navigator.vibrate([200, 100, 200]);
 
-  // Banner superior dentro de la app
   const banner = document.getElementById('pushBanner');
   document.getElementById('pushTitle').textContent = title;
   document.getElementById('pushBody').textContent = body;
   banner.classList.add('show');
 
-  // Contador
   unreadNotifs++;
   document.getElementById('notifCounter').textContent = unreadNotifs;
 
-  // Notificación nativa del sistema si está permitida
   if ('Notification' in window && Notification.permission === 'granted') {
     try {
-      new Notification(title, { body: body });
-    } catch (e) {
-      // Respaldo silencioso en WebView
-    }
+      new Notification(title, { body });
+    } catch (e) {}
   }
 
-  setTimeout(() => {
-    banner.classList.remove('show');
-  }, 4500);
+  setTimeout(() => banner.classList.remove('show'), 5000);
 }
 
 function closePushBanner() {
   document.getElementById('pushBanner').classList.remove('show');
 }
 
-// ================= RENDERIZADO DE PANTALLAS =================
+// ================= RENDERIZADO =================
 function renderIncidents() {
   const container = document.getElementById('incidentsList');
   const filtered = currentZoneFilter === 'Todos'
     ? incidents
     : incidents.filter(i => i.zone === currentZoneFilter);
 
-  container.innerHTML = filtered.map(item => `
-    <article class="incident-card ${item.severity}">
-      <div class="card-header-row">
-        <span class="tag-type"><i class="fa-solid fa-triangle-exclamation"></i> ${item.type}</span>
-        <span class="tag-zone">${item.zone}</span>
-      </div>
-      <div class="card-place">${item.place}</div>
-      <p class="card-desc">${item.desc}</p>
-      <div class="card-footer-row">
-        <span class="time-text"><i class="fa-regular fa-clock"></i> ${item.time}</span>
-        <button class="btn-confirm ${item.confirmedByUser ? 'confirmed' : ''}" onclick="confirmIncident(${item.id})">
-          <i class="fa-solid fa-thumbs-up"></i> Confirmar (${item.confirmations})
-        </button>
-      </div>
-    </article>
-  `).join('');
+  container.innerHTML = filtered.map(item => {
+    const itemId = item.fbKey || String(item.id);
+    const isConfirmed = confirmedIds.includes(itemId);
+    return `
+      <article class="incident-card ${item.severity}">
+        <div class="card-header-row">
+          <span class="tag-type"><i class="fa-solid fa-triangle-exclamation"></i> ${item.type}</span>
+          <span class="tag-zone">${item.zone}</span>
+        </div>
+        <div class="card-place">${item.place}</div>
+        <p class="card-desc">${item.desc}</p>
+        <div class="card-footer-row">
+          <span class="time-text"><i class="fa-regular fa-clock"></i> ${formatRelativeTime(item.createdAt)}</span>
+          <button class="btn-confirm ${isConfirmed ? 'confirmed' : ''}" onclick="confirmIncident('${itemId}')">
+            <i class="fa-solid fa-thumbs-up"></i> Confirmar (${item.confirmations || 1})
+          </button>
+        </div>
+      </article>
+    `;
+  }).join('');
 }
 
 function renderPatrolZones() {
@@ -317,19 +354,27 @@ function filterPatrolByZone(zone, btn) {
   renderPatrolZones();
 }
 
-function confirmIncident(id) {
-  const item = incidents.find(i => i.id === id);
+async function confirmIncident(itemId) {
+  if (confirmedIds.includes(itemId)) return;
+
+  const item = incidents.find(i => (i.fbKey || String(i.id)) === itemId);
   if (!item) return;
 
-  if (!item.confirmedByUser) {
-    item.confirmations++;
-    item.confirmedByUser = true;
-  } else {
-    item.confirmations--;
-    item.confirmedByUser = false;
-  }
-  saveState();
+  const newCount = (item.confirmations || 1) + 1;
+  item.confirmations = newCount;
+  confirmedIds.push(itemId);
+  localStorage.setItem('hyo_confirmed_ids', JSON.stringify(confirmedIds));
   renderIncidents();
+
+  if (item.fbKey) {
+    try {
+      await fetch(`${FIREBASE_DB_URL}/reportes/${item.fbKey}.json`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ confirmations: newCount })
+      });
+    } catch (e) {}
+  }
 }
 
 function setReportMode(mode) {
@@ -363,7 +408,7 @@ function selectPatrolType(btn, agency) {
   selectedPatrolAgency = agency;
 }
 
-function submitDangerReport() {
+async function submitDangerReport() {
   const zone = document.getElementById('dangerZone').value;
   const place = document.getElementById('dangerPlace').value.trim();
   const desc = document.getElementById('dangerDesc').value.trim() || 'Reportado por usuario de la comunidad.';
@@ -374,32 +419,41 @@ function submitDangerReport() {
   }
 
   const newReport = {
-    id: Date.now(),
     type: selectedDanger.type,
     severity: selectedDanger.severity,
-    zone: zone,
-    place: place,
-    desc: desc,
-    time: 'Ahora mismo',
-    confirmations: 1,
-    confirmedByUser: true
+    zone,
+    place,
+    desc,
+    createdAt: Date.now(),
+    confirmations: 1
   };
 
-  incidents.unshift(newReport);
-  saveState();
-  renderIncidents();
+  try {
+    const res = await fetch(`${FIREBASE_DB_URL}/reportes.json`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(newReport)
+    });
+    const saved = await res.json();
+    if (saved && saved.name) {
+      lastKnownIncidentKey = saved.name;
+    }
+    await fetchCloudData(true);
+  } catch (e) {
+    showPushNotification('Error de red', 'No se pudo conectar con la nube. Revisa tu internet.');
+    return;
+  }
 
   document.getElementById('dangerPlace').value = '';
   document.getElementById('dangerDesc').value = '';
-
   switchTab('feed');
   showPushNotification(
-    `Alerta en ${zone}: ${selectedDanger.type}`,
-    `${place} · Se notificó a los usuarios cercanos.`
+    `Reporte publicado en ${zone}`,
+    `${selectedDanger.type} en ${place} · Visible para todos los usuarios.`
   );
 }
 
-function submitPatrolReport() {
+async function submitPatrolReport() {
   const zone = document.getElementById('safeZone').value;
   const place = document.getElementById('safePlace').value.trim();
   const schedule = document.getElementById('safeSchedule').value.trim() || 'Vigilancia reportada por vecinos';
@@ -409,20 +463,28 @@ function submitPatrolReport() {
     return;
   }
 
-  patrolZones.unshift({
-    id: Date.now(),
+  const newPatrol = {
     agency: selectedPatrolAgency,
-    zone: zone,
-    place: place,
-    schedule: schedule
-  });
+    zone,
+    place,
+    schedule,
+    createdAt: Date.now()
+  };
 
-  saveState();
-  renderPatrolZones();
+  try {
+    await fetch(`${FIREBASE_DB_URL}/vigilados.json`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(newPatrol)
+    });
+    await fetchCloudData(true);
+  } catch (e) {
+    showPushNotification('Error de red', 'No se pudo guardar en la nube.');
+    return;
+  }
 
   document.getElementById('safePlace').value = '';
   document.getElementById('safeSchedule').value = '';
-
   switchTab('patrol');
   showPushNotification(
     `Zona vigilada agregada (${zone})`,
@@ -430,7 +492,7 @@ function submitPatrolReport() {
   );
 }
 
-function simulateIncomingAlert() {
+async function simulateIncomingAlert() {
   const sampleAlerts = [
     { type: 'Arrebato', zone: 'El Tambo', place: 'Av. Universitaria / Ciudad Universitaria', desc: 'Alerta vecinal reciente en paradero.' },
     { type: 'Calle oscura', zone: 'Chilca', place: 'Jr. Próceres y Av. 9 de Diciembre', desc: 'Tramo sin iluminación pública.' },
@@ -438,24 +500,28 @@ function simulateIncomingAlert() {
   ];
   const random = sampleAlerts[Math.floor(Math.random() * sampleAlerts.length)];
 
-  incidents.unshift({
-    id: Date.now(),
-    type: random.type,
-    severity: random.type === 'Arrebato' ? 'high' : 'medium',
-    zone: random.zone,
-    place: random.place,
-    desc: random.desc,
-    time: 'Hace 1 min',
-    confirmations: 2,
-    confirmedByUser: false
+  await fetch(`${FIREBASE_DB_URL}/reportes.json`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      type: random.type,
+      severity: random.type === 'Arrebato' ? 'high' : 'medium',
+      zone: random.zone,
+      place: random.place,
+      desc: random.desc,
+      createdAt: Date.now(),
+      confirmations: 1
+    })
   });
 
-  saveState();
-  renderIncidents();
-  showPushNotification(`Alerta Vecinal · ${random.zone}`, `${random.type} en ${random.place}`);
+  await fetchCloudData(false);
 }
 
-// Inicializar vistas
+// ================= INICIO Y ACTUALIZACIÓN AUTOMÁTICA =================
 renderIncidents();
 renderPatrolZones();
 renderContacts();
+fetchCloudData(true);
+
+// Consulta cada 6 segundos si otros usuarios publicaron algo nuevo
+setInterval(() => fetchCloudData(false), 6000);
